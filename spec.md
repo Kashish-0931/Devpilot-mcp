@@ -313,7 +313,16 @@ Every shell command in this spec is given in **Windows PowerShell** syntax (`$en
   claude mcp add --transport http devpilot http://localhost:8080/mcp --header "Authorization: Bearer $env:DEVPILOT_MCP_TOKEN"
   ```
   registers DevPilot as an MCP server Claude Code can call in the Ask flow.
-- **Claude Desktop note**: Desktop requires **HTTPS** for remote (non-localhost) MCP servers. `http://localhost:8080` is fine while developing on the same machine; once the server moves to EC2 (Stage 2), a Desktop connection needs TLS in front of it (e.g. a reverse proxy) — Claude Code's CLI connection over plain HTTP to `localhost` is not affected by this and remains the primary dev-loop path for Stage 1.
+- **Claude Desktop note**: Desktop requires **HTTPS** for remote (non-localhost) MCP servers. `http://127.0.0.1:8080` is fine while developing on the same machine; once the server moves to EC2 (Stage 2), a Desktop connection needs TLS in front of it (e.g. a reverse proxy) — Claude Code's CLI connection over plain HTTP to `127.0.0.1` is not affected by this and remains the primary dev-loop path for Stage 1.
+
+### 6.12b Lessons learned (from manual verification on Windows)
+
+These came out of actually running the full local stack (DynamoDB Local + server + MCP Inspector) end to end on Windows — folded back into the spec so they're not re-discovered every time:
+
+- **Use `127.0.0.1`, not `localhost`, in every URL** (Inspector, `claude mcp add`, curl, browser). `localhost` can resolve to the IPv6 loopback (`::1`) first on Windows, but the server only binds the IPv4 wildcard (`0.0.0.0`) — so `localhost` intermittently fails to connect while `127.0.0.1` always works.
+- **`$env:` variables don't survive a terminal restart** — they're per-session. This is exactly why §6.11 added `.env` support (via `python-dotenv`, loaded in `__main__.py`): real env vars still win when set, but config now survives closing the terminal.
+- **Run MCP Inspector in its own plain PowerShell window, not a VS Code integrated terminal** — VS Code's shell auto-activation (venv activation, prompt customization, etc.) can interrupt Inspector's own process management. Each Inspector restart also prints a fresh session/auth URL — always use the one from the *current* run, not a copied old one.
+- **DynamoDB Local (`-inMemory`) loses all data on container restart** — including the table itself. Re-run `scripts/bootstrap_local_table.py` after every `docker restart`/recreate of the DynamoDB Local container, or the server will fail with a missing-table error.
 
 ### 6.13 Execution steps (in order)
 

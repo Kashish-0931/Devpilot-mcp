@@ -25,6 +25,20 @@ def test_recent_respects_limit(journal_store):
     assert len(results) == 2
 
 
+def test_float_metadata_does_not_crash_put_item(journal_store):
+    journal_store.record(
+        source="watchdog",
+        level="warning",
+        message="disk usage high",
+        metadata={"disk_pct": 91.5, "thresholds": [10.0, 20.5]},
+    )
+
+    (result,) = journal_store.recent()
+
+    assert result.metadata["disk_pct"] == 91.5
+    assert result.metadata["thresholds"] == [10.0, 20.5]
+
+
 def test_metadata_round_trips(journal_store):
     entry = journal_store.record(
         source="watchdog",

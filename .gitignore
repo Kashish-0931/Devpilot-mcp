@@ -18,6 +18,7 @@ env/
 .ruff_cache/
 .coverage
 htmlcov/
+*.log
 
 .vscode/
 .idea/
