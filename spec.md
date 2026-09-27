@@ -273,7 +273,7 @@ Local run: `python -m devpilot.server`.
 ### 6.9 Tests (`moto`-backed, no real AWS)
 
 - Root `conftest.py`:
-  - **`fake_aws_credentials` fixture, `autouse=True`**: sets `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_DEFAULT_REGION` to dummy values (`monkeypatch.setenv`, so they're reverted after each test) — every test runs with fake credentials in the environment, so a test that forgets to inject the moto-mocked store still can't reach a real AWS account.
+  - **`fake_aws_credentials` fixture, `autouse=True`**: sets `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_DEFAULT_REGION` to dummy values (`monkeypatch.setenv`, so they're reverted after each test) — every test runs with fake credentials in the environment, so a test that forgets to inject the moto-mocked store still can't reach a real AWS account. It also `monkeypatch.delenv("AWS_ENDPOINT_URL_DYNAMODB", raising=False)`, so `pytest` always exercises `moto` even if the shell it runs in still has the DynamoDB Local override (§6.3a) set from a previous smoke-test session.
   - `dynamodb_resource` fixture (`moto.mock_aws`), `journal_table` fixture (calls `create_journal_table` with a fixed test table name), `journal_store` fixture (`JournalStore(table=journal_table)`).
 - `test_models.py` — defaults (uuid4 `id`, ISO `timestamp`), bad-`level` → `ValueError`, frozen (`FrozenInstanceError` on mutation), `to_item`/`from_item` round-trip.
 - `test_store.py` — `record()` then `recent()` returns it; multiple records come back newest-first; `limit` respected; nested `metadata` round-trips.
@@ -294,7 +294,7 @@ Local run: `python -m devpilot.server`.
 | Var | Meaning | Default |
 |---|---|---|
 | `DEVPILOT_JOURNAL_TABLE` | DynamoDB table name | `devpilot-journal` |
-| `DEVPILOT_MCP_TOKEN` | Shared bearer token, read once at startup by `app.py` | *(required, no default — server fails fast if unset)* |
+| `DEVPILOT_MCP_TOKEN` | Shared bearer token, read once at startup by `__main__.py` (not `app.py` — see §6.8) | *(required, no default — server fails fast if unset)* |
 | `DEVPILOT_MCP_PORT` | Local/EC2 listen port | `8080` |
 | `AWS_ENDPOINT_URL_DYNAMODB` | Standard AWS SDK override, used only for local smoke testing against DynamoDB Local (§6.3a) — not a DevPilot-specific var | unset in normal/real use |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION` | Dummy credentials required by boto3 to talk to DynamoDB Local (§6.3a); real region resolution elsewhere still comes from boto3's normal chain, not this var | `dummy` / `dummy` / `ap-south-1`, local smoke-testing only |
