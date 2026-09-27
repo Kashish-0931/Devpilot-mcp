@@ -51,7 +51,7 @@ Nothing else exists. No AWS resources are provisioned. The account is on the **A
 ## 5. Build order
 
 1. **Journal** — append-only audit/event log (DynamoDB-backed), readable *and writable* by humans and by DevPilot itself. *Not started* (despite an earlier doc marking it done — no code exists). **This spec covers it in full.**
-2. **Docker + EC2** — containerize the MCP server, run on EC2. Provisioned **manually via the AWS console** for now (instance, IAM role, security group, ECR repo).
+2. **Docker + EC2** — containerize the MCP server, run on EC2. Provisioned **manually via the AWS console** for now: instance, IAM role, security group, ECR repo, and the `devpilot-journal` DynamoDB table itself (`pk` String, `sk` String, on-demand/`PAY_PER_REQUEST` capacity — same schema as Stage 1's dev-only `create_journal_table`, now created for real).
 3. **Watchdog** — shared check functions (EC2 status, Docker container status, CloudWatch log tail), exposed both as MCP tools and used by a background polling loop.
 4. **Security scan** — CI scanning (Trivy, `pip-audit`) plus an on-demand `security_audit()` MCP tool for AWS account posture.
 5. **Alerts** — the automatic Alert flow (SNS → Lambda → LLM diagnosis → Telegram/email).
@@ -126,13 +126,19 @@ Module-level **`create_journal_table(resource, table_name)`**: dev/test bootstra
 
 ### 6.3a Local DynamoDB for smoke testing
 
-`store.py` needs **no code changes** to support this — botocore already honors the per-service endpoint override env var. To smoke-test against a real (local) DynamoDB wire protocol instead of `moto`'s in-process mock:
+`store.py` needs **no code changes** to support this — botocore already honors the per-service endpoint override env var. To smoke-test against a real (local) DynamoDB wire protocol instead of `moto`'s in-process mock (all commands in **PowerShell** syntax, per project convention — see §6.12a):
 
-```
+```powershell
 docker run -d -p 8000:8000 amazon/dynamodb-local
+$env:AWS_ENDPOINT_URL_DYNAMODB = "http://localhost:8000"
+$env:AWS_ACCESS_KEY_ID = "dummy"
+$env:AWS_SECRET_ACCESS_KEY = "dummy"
+$env:AWS_DEFAULT_REGION = "ap-south-1"
 ```
 
-Then set `AWS_ENDPOINT_URL_DYNAMODB=http://localhost:8000` in the shell before running the server or the bootstrap script — `boto3.resource("dynamodb")` picks it up automatically.
+DynamoDB Local doesn't validate credentials, but boto3 still refuses to build a client with none configured — the three dummy `AWS_*` vars satisfy that without ever touching a real AWS account. `boto3.resource("dynamodb")` picks up `AWS_ENDPOINT_URL_DYNAMODB` automatically once it's set.
+
+`conftest.py` sets the same three dummy credential vars via an **autouse** fixture (§6.9), so the `pytest` suite can never fall through to a real AWS account even if a test forgets to inject the moto-mocked store.
 
 **`scripts/bootstrap_local_table.py`**: a small script that builds a `boto3.resource("dynamodb")` (relying on the same env-var override) and calls `create_journal_table(resource, journal_table_name())` against it — run once before smoke-testing the server locally.
 
@@ -150,7 +156,7 @@ Single source of truth shared by `store.py`, `server/app.py`, `scripts/bootstrap
 
 ### 6.5 Auth — `server/auth.py`
 
-The expected token is read **once, at startup** (in `app.py`, §6.6) and passed in — `verify_token` never touches `os.environ` per request, and a missing token fails the process immediately with a clear error instead of failing confusingly on the first request:
+The expected token is read **once, at startup** (in `__main__.py`, §6.8 — not `app.py`) and passed all the way down as a plain argument — `verify_token` never touches `os.environ`, and a missing token fails the process immediately with a clear error instead of failing confusingly on the first request:
 
 ```python
 from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -168,72 +174,110 @@ class StaticTokenVerifier(TokenVerifier):
 
 A single static bearer token via `DEVPILOT_MCP_TOKEN` is the right scope for Stage 1 (one server, one caller — Claude). Token rotation / multiple callers / real OAuth is explicitly out of scope until it's an actual requirement — don't build it preemptively.
 
-### 6.6 Server — `server/app.py`
+### 6.6 Server — `server/app.py` (factory, no module-level `mcp`)
+
+`app.py` exposes a **factory**, `create_app(...)`, instead of building a module-level `mcp`/`app` at import time. This does two things: it lets tests build an app wired to a moto-backed store without touching real config, and it means `tools.py` never needs to import anything from `app.py` — tool functions are plain, store-taking functions (§6.7) that `create_app` wraps in closures and registers, so there's **no circular import** between `app.py` and `tools.py` in either direction. Reading `DEVPILOT_MCP_TOKEN` and failing fast if it's missing moves entirely to `__main__.py` (§6.8) — `app.py` never reads `os.environ` itself, it just takes `token`/`port` as parameters:
 
 ```python
-import os
 from mcp.server import MCPServer
 from mcp.server.auth.settings import AuthSettings
 from pydantic import AnyHttpUrl
 
-port = int(os.environ.get("DEVPILOT_MCP_PORT", "8080"))
+from devpilot.journal.store import JournalStore
+from devpilot.server import tools
+from devpilot.server.auth import StaticTokenVerifier
 
-expected_token = os.environ.get("DEVPILOT_MCP_TOKEN")
-if not expected_token:
-    raise RuntimeError("DEVPILOT_MCP_TOKEN must be set before starting the DevPilot MCP server")
 
-mcp = MCPServer(
-    "devpilot",
-    token_verifier=StaticTokenVerifier(expected_token),
-    auth=AuthSettings(
-        issuer_url=AnyHttpUrl(f"http://localhost:{port}"),
-        resource_server_url=AnyHttpUrl(f"http://localhost:{port}/mcp"),
-        required_scopes=[],
-        validate_token_resource=False,
-    ),
-)
-# server.tools imports register @mcp.tool() functions against `mcp`
-app = mcp.streamable_http_app()
+def create_app(token: str, store: JournalStore | None = None, port: int = 8080):
+    store = store or JournalStore()
+
+    mcp = MCPServer(
+        "devpilot",
+        token_verifier=StaticTokenVerifier(token),
+        auth=AuthSettings(
+            issuer_url=AnyHttpUrl(f"http://localhost:{port}"),
+            resource_server_url=AnyHttpUrl(f"http://localhost:{port}/mcp"),
+            required_scopes=[],
+            validate_token_resource=False,
+        ),
+    )
+
+    @mcp.tool()
+    def get_recent_journal_entries(limit: int = 50) -> list[dict]:
+        """Return the most recent DevPilot journal entries, newest first."""
+        return tools.get_recent_journal_entries(store, limit)
+
+    @mcp.tool()
+    def log_journal_entry(message: str, level: str = "info", metadata: dict | None = None) -> dict:
+        """Record a human-authored note or decision in the DevPilot journal."""
+        return tools.log_journal_entry(store, message, level, metadata)
+
+    return mcp.streamable_http_app()
 ```
 
 `issuer_url`/`resource_server_url` are placeholders satisfying the SDK's OAuth-shaped interface — we are not doing real OAuth discovery, just reusing its bearer-token check. Revisit only if a real external OAuth issuer becomes a requirement.
 
-### 6.7 Tools — `server/tools.py`
+### 6.7 Tools — `server/tools.py` (plain functions, store passed in)
 
-Two tools in Stage 1 — the journal is readable *and* writable, not read-only:
+Two tools in Stage 1 — the journal is readable *and* writable, not read-only. Each is a **plain function taking the store explicitly**, not a decorated closure — `create_app` (§6.6) is what wraps them as `@mcp.tool()`-registered closures. This is also exactly what lets `test_tools.py` call them directly with an injected moto-backed store, with no MCP framework or running server involved:
 
 ```python
-@mcp.tool()
-def get_recent_journal_entries(limit: int = 50) -> list[dict]:
-    """Return the most recent DevPilot journal entries, newest first."""
-    store = JournalStore()
-    return [asdict(e) for e in store.recent(limit)]
+from dataclasses import asdict
 
-@mcp.tool()
-def log_journal_entry(message: str, level: str = "info", source: str = "human", metadata: dict | None = None) -> dict:
-    """Record a note or decision in the DevPilot journal (defaults to a human-authored entry)."""
-    store = JournalStore()
-    entry = store.record(source=source, level=level, message=message, metadata=metadata or {})
+from devpilot.journal.store import JournalStore
+
+
+def get_recent_journal_entries(store: JournalStore, limit: int = 50) -> list[dict]:
+    return [asdict(entry) for entry in store.recent(limit)]
+
+
+def log_journal_entry(store: JournalStore, message: str, level: str = "info", metadata: dict | None = None) -> dict:
+    """Always source="human" — this tool is for people, not internal code."""
+    entry = store.record(source="human", level=level, message=message, metadata=metadata or {})
     return asdict(entry)
 ```
 
-Both return plain dicts (not `to_item()`, which is DynamoDB-shaped), so MCP results are directly JSON-able. Stage 3 adds three more tools (`check_instance`, `check_container`, `tail_logs`) alongside these in the same module; Stage 4 adds `security_audit()`; Stage 7 adds `search_codebase`.
+`log_journal_entry` has **no `source` parameter** — it's a human-facing tool, so every entry it creates is `source="human"`. The other sources (`"watchdog"`, `"alert"`, `"deploy"`, `"security-scan"`, `"codebase-brain"`) are only ever passed by internal code calling `JournalStore.record(...)` directly (Stage 3 onward), never through this tool.
+
+Both tools return plain dicts (not `to_item()`, which is DynamoDB-shaped), so MCP results are directly JSON-able. Stage 3 adds three more tools (`check_instance`, `check_container`, `tail_logs`) alongside these in the same module; Stage 4 adds `security_audit()`; Stage 7 adds `search_codebase`.
 
 ### 6.8 Entrypoint — `server/__main__.py`
 
+This is where `DEVPILOT_MCP_TOKEN` is actually read and validated — the only place in Stage 1 that fails fast on a missing token:
+
 ```python
+import os
+import sys
+
+import uvicorn
+
+from devpilot.server.app import create_app
+
+
+def main() -> None:
+    token = os.environ.get("DEVPILOT_MCP_TOKEN")
+    if not token:
+        sys.exit("DEVPILOT_MCP_TOKEN must be set before starting the DevPilot MCP server")
+
+    port = int(os.environ.get("DEVPILOT_MCP_PORT", "8080"))
+    app = create_app(token, port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("DEVPILOT_MCP_PORT", "8080")))
+    main()
 ```
 
 Local run: `python -m devpilot.server`.
 
 ### 6.9 Tests (`moto`-backed, no real AWS)
 
-- Root `conftest.py`: `dynamodb_resource` fixture (`moto.mock_aws`), `journal_table` fixture (calls `create_journal_table` with a fixed test table name), `journal_store` fixture (`JournalStore(table=journal_table)`).
+- Root `conftest.py`:
+  - **`fake_aws_credentials` fixture, `autouse=True`**: sets `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_DEFAULT_REGION` to dummy values (`monkeypatch.setenv`, so they're reverted after each test) — every test runs with fake credentials in the environment, so a test that forgets to inject the moto-mocked store still can't reach a real AWS account.
+  - `dynamodb_resource` fixture (`moto.mock_aws`), `journal_table` fixture (calls `create_journal_table` with a fixed test table name), `journal_store` fixture (`JournalStore(table=journal_table)`).
 - `test_models.py` — defaults (uuid4 `id`, ISO `timestamp`), bad-`level` → `ValueError`, frozen (`FrozenInstanceError` on mutation), `to_item`/`from_item` round-trip.
 - `test_store.py` — `record()` then `recent()` returns it; multiple records come back newest-first; `limit` respected; nested `metadata` round-trips.
-- `test_tools.py` — calls `get_recent_journal_entries` **and** `log_journal_entry` directly (not over HTTP) against an injected store; confirms a `log_journal_entry` write shows up in a subsequent `get_recent_journal_entries` call.
+- `test_tools.py` — calls `tools.get_recent_journal_entries(store, limit)` **and** `tools.log_journal_entry(store, message, ...)` directly (plain functions, §6.7 — not over HTTP, no `create_app`) against an injected moto-backed store; confirms a `log_journal_entry` write shows up in a subsequent `get_recent_journal_entries` call, and that its `source` is always `"human"`.
 - `test_auth.py` — `StaticTokenVerifier(expected).verify_token(...)`: correct token → `AccessToken`; wrong/missing → `None`. No running server required.
 
 `scripts/bootstrap_local_table.py` is a manual smoke-test convenience, not covered by `pytest`.
@@ -253,15 +297,20 @@ Local run: `python -m devpilot.server`.
 | `DEVPILOT_MCP_TOKEN` | Shared bearer token, read once at startup by `app.py` | *(required, no default — server fails fast if unset)* |
 | `DEVPILOT_MCP_PORT` | Local/EC2 listen port | `8080` |
 | `AWS_ENDPOINT_URL_DYNAMODB` | Standard AWS SDK override, used only for local smoke testing against DynamoDB Local (§6.3a) — not a DevPilot-specific var | unset in normal/real use |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_DEFAULT_REGION` | Dummy credentials required by boto3 to talk to DynamoDB Local (§6.3a); real region resolution elsewhere still comes from boto3's normal chain, not this var | `dummy` / `dummy` / `ap-south-1`, local smoke-testing only |
 
 Deliberately **no** `DEVPILOT_AWS_REGION` — boto3's normal credential/region chain (env, `~/.aws/config`, instance metadata) owns that; don't introduce a DevPilot-specific override unless a real need appears.
+
+### 6.12a Shell convention
+
+Every shell command in this spec is given in **Windows PowerShell** syntax (`$env:VAR = "value"`, not `export VAR=value` or `VAR=value`), matching the project's actual dev environment.
 
 ### 6.12 Connecting a client
 
 - **MCP Inspector** (quick manual poking): run the server (`python -m devpilot.server`), then `npx @modelcontextprotocol/inspector` and point it at `http://localhost:8080/mcp` with an `Authorization: Bearer <DEVPILOT_MCP_TOKEN>` header — confirms both tools show up and are callable before wiring up a real client.
 - **Claude Code CLI**:
-  ```
-  claude mcp add --transport http devpilot http://localhost:8080/mcp --header "Authorization: Bearer $DEVPILOT_MCP_TOKEN"
+  ```powershell
+  claude mcp add --transport http devpilot http://localhost:8080/mcp --header "Authorization: Bearer $env:DEVPILOT_MCP_TOKEN"
   ```
   registers DevPilot as an MCP server Claude Code can call in the Ask flow.
 - **Claude Desktop note**: Desktop requires **HTTPS** for remote (non-localhost) MCP servers. `http://localhost:8080` is fine while developing on the same machine; once the server moves to EC2 (Stage 2), a Desktop connection needs TLS in front of it (e.g. a reverse proxy) — Claude Code's CLI connection over plain HTTP to `localhost` is not affected by this and remains the primary dev-loop path for Stage 1.
@@ -269,12 +318,23 @@ Deliberately **no** `DEVPILOT_AWS_REGION` — boto3's normal credential/region c
 ### 6.13 Execution steps (in order)
 
 1. `journal/config.py`, `journal/models.py`, `journal/store.py`.
-2. `server/__init__.py`, `server/auth.py`, `server/tools.py`, `server/app.py`, `server/__main__.py`.
+2. `server/__init__.py`, `server/auth.py`, `server/tools.py` (plain functions), `server/app.py` (`create_app` factory), `server/__main__.py` (reads/validates `DEVPILOT_MCP_TOKEN`).
 3. `scripts/bootstrap_local_table.py`.
 4. Bump `requires-python` to `>=3.12`; add `mcp`, `uvicorn` to `pyproject.toml`.
-5. `conftest.py` + the four test files.
+5. `conftest.py` (including the autouse fake-credentials fixture) + the four test files.
 6. venv, `pip install -e ".[dev]"`, `pytest`.
-7. Manual smoke test: `docker run -d -p 8000:8000 amazon/dynamodb-local`, set `AWS_ENDPOINT_URL_DYNAMODB=http://localhost:8000`, run `scripts/bootstrap_local_table.py`, then run `python -m devpilot.server` with `DEVPILOT_MCP_TOKEN` set — confirm it fails fast if the token is unset, then confirm 401 with a wrong token and success with the right one.
+7. Manual smoke test (PowerShell):
+   ```powershell
+   docker run -d -p 8000:8000 amazon/dynamodb-local
+   $env:AWS_ENDPOINT_URL_DYNAMODB = "http://localhost:8000"
+   $env:AWS_ACCESS_KEY_ID = "dummy"
+   $env:AWS_SECRET_ACCESS_KEY = "dummy"
+   $env:AWS_DEFAULT_REGION = "ap-south-1"
+   python scripts/bootstrap_local_table.py
+   $env:DEVPILOT_MCP_TOKEN = "<some local token>"
+   python -m devpilot.server
+   ```
+   Confirm the server fails fast if `DEVPILOT_MCP_TOKEN` is unset, then confirm 401 with a wrong token and success with the right one.
 8. Connect via MCP Inspector, then via `claude mcp add ...` (§6.12); confirm both tools are visible and callable end-to-end (write with `log_journal_entry`, read it back with `get_recent_journal_entries`).
 9. Commit, push to `origin/main`.
 
@@ -282,7 +342,7 @@ Deliberately **no** `DEVPILOT_AWS_REGION` — boto3's normal credential/region c
 
 ## 7. Stages 2–8 spec (architecture-level)
 
-- **Docker + EC2** — containerize `devpilot.server` (`python:3.12-slim`, `python -m devpilot.server`), push to ECR, run on a single EC2 instance with a least-privilege instance IAM role (`PutItem`/`Query` scoped to the journal table ARN). Provisioned **manually via the AWS console** (instance, security group, ECR repo, IAM role) in region **ap-south-1**, sized per §8 (t3.micro). Folded into the **Terraform pass** after Stage 5, which codifies this stage's resources retroactively.
+- **Docker + EC2** — containerize `devpilot.server` (`python:3.12-slim`, `python -m devpilot.server`), push to ECR, run on a single EC2 instance with a least-privilege instance IAM role (`PutItem`/`Query` scoped to the journal table ARN). Provisioned **manually via the AWS console** — instance, security group, ECR repo, IAM role, **and** the `devpilot-journal` DynamoDB table (`pk` String, `sk` String, on-demand capacity) — in region **ap-south-1**, sized per §8 (t3.micro). Folded into the **Terraform pass** after Stage 5, which codifies this stage's resources retroactively.
 - **Watchdog** — shared check functions (`check_instance`, `check_container`, `tail_logs`) written **once** and used two ways: exposed as `@mcp.tool()` functions in `server/tools.py` so the Ask flow can call them on demand, *and* called directly from a background polling loop (second container, or systemd/cron on the same instance) that writes findings to the journal (`source="watchdog"`) via `JournalStore.record(...)` **in-process** — the first proof the store works outside the MCP-tool request path. No AWS resources beyond what Stage 2 already provisioned unless a separate schedule is added later.
 - **Security scan** — CI-run image/dependency scanning (Trivy, `pip-audit`) before ECR push stays as-is, results logged to the journal (`source="security-scan"`). **Additionally**, an on-demand `security_audit()` MCP tool checks AWS account posture directly: public S3 buckets, port 22 open to `0.0.0.0/0`, root account without MFA, IAM access keys older than 90 days — so the Ask flow can answer "is anything insecure right now" the same way it answers infra-health questions, not just via CI.
 - **Alerts** — CloudWatch Alarm → SNS → Lambda, reusing the `check_instance`/`check_container`/`tail_logs` logic from Stage 3 instead of duplicating it, calling the Claude API for diagnosis (kept minimal — alerts only, §8), sending Telegram/email, writing the outcome to the journal (`source="alert"`). Lambda's role needs journal-table write access; `JournalStore` already works fine constructed fresh per invocation. Secrets (Telegram bot token, Claude API key) live in **SSM Parameter Store SecureString**, not Secrets Manager (§8). Provisioned manually for now; folded into the Terraform pass below.
