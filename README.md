@@ -72,6 +72,8 @@ In the UI that opens: Transport Type = `Streamable HTTP`, URL = `http://127.0.0.
 
 ### Connect with Claude Code
 
+Run this as **one line** — if it gets split across lines (e.g. a multi-line paste with no continuation character), `--header` silently gets dropped and the server will reject every request with `401`:
+
 ```powershell
 claude mcp add --transport http devpilot http://127.0.0.1:8080/mcp --header "Authorization: Bearer <your DEVPILOT_MCP_TOKEN>"
 claude mcp get devpilot   # should show: Status: Connected
@@ -87,6 +89,7 @@ Then open a **new** `claude` session in this folder and just ask it to log or re
 | Config seems to reset after closing the terminal | `$env:` variables are per-session. Put persistent values in `.env` instead — see Setup above. |
 | MCP Inspector misbehaves / disconnects unexpectedly | Run it in a plain PowerShell window, not a VS Code integrated terminal — VS Code's shell auto-activation can interrupt it. Also make sure you're using the URL from the *current* Inspector run, not a stale one from a previous restart. |
 | Server error about a missing table | DynamoDB Local (`-inMemory`) loses all data, including the table, on container restart. Re-run `python scripts/bootstrap_local_table.py`. |
-| `401` from the server | Token mismatch — the `Authorization: Bearer ...` header doesn't match `DEVPILOT_MCP_TOKEN` in `.env` (or whatever's currently set). Missing token also gives `401`. |
+| `401` from the server | Token mismatch — the `Authorization: Bearer ...` header doesn't match `DEVPILOT_MCP_TOKEN` in `.env` (or whatever's currently set). Missing token also gives `401`. If you ran `claude mcp add` as a multi-line paste, check `claude mcp get devpilot` actually shows a `Headers:` line — a split command silently drops `--header` with no error. |
+| `Protected resource ... does not match expected ...` (not a plain `401`) | You connected via `localhost` while the server advertises `127.0.0.1` (or vice versa) — the SDK's OAuth resource check is strict about this even though they're the same machine. Always use `127.0.0.1` everywhere (Inspector, `claude mcp add`), matching `app.py`. |
 | `only one usage of each socket address ... 8080` | Something's already listening on port 8080 — likely a previous `python -m devpilot.server` still running. Find it (`netstat -ano \| findstr :8080`) and stop it, or set a different `DEVPILOT_MCP_PORT`. |
 | Server won't start, prints `DEVPILOT_MCP_TOKEN must be set` | Expected — the server fails fast rather than starting insecurely. Set it in `.env` or `$env:DEVPILOT_MCP_TOKEN`. |

@@ -195,8 +195,8 @@ def create_app(token: str, store: JournalStore | None = None, port: int = 8080):
         "devpilot",
         token_verifier=StaticTokenVerifier(token),
         auth=AuthSettings(
-            issuer_url=AnyHttpUrl(f"http://localhost:{port}"),
-            resource_server_url=AnyHttpUrl(f"http://localhost:{port}/mcp"),
+            issuer_url=AnyHttpUrl(f"http://127.0.0.1:{port}"),
+            resource_server_url=AnyHttpUrl(f"http://127.0.0.1:{port}/mcp"),
             required_scopes=[],
             validate_token_resource=False,
         ),
@@ -216,6 +216,8 @@ def create_app(token: str, store: JournalStore | None = None, port: int = 8080):
 ```
 
 `issuer_url`/`resource_server_url` are placeholders satisfying the SDK's OAuth-shaped interface — we are not doing real OAuth discovery, just reusing its bearer-token check. Revisit only if a real external OAuth issuer becomes a requirement.
+
+**Must be `127.0.0.1`, not `localhost`** — the SDK validates that the host a client actually connects to matches `resource_server_url`, even with `validate_token_resource=False`. Every client-facing instruction in this spec (§6.12) uses `127.0.0.1` for the same reason (§6.12b) — if they ever drift apart, connections fail with a "Protected resource ... does not match expected ..." error, not a plain `401`.
 
 ### 6.7 Tools — `server/tools.py` (plain functions, store passed in)
 
@@ -307,10 +309,10 @@ Every shell command in this spec is given in **Windows PowerShell** syntax (`$en
 
 ### 6.12 Connecting a client
 
-- **MCP Inspector** (quick manual poking): run the server (`python -m devpilot.server`), then `npx @modelcontextprotocol/inspector` and point it at `http://localhost:8080/mcp` with an `Authorization: Bearer <DEVPILOT_MCP_TOKEN>` header — confirms both tools show up and are callable before wiring up a real client.
-- **Claude Code CLI**:
+- **MCP Inspector** (quick manual poking): run the server (`python -m devpilot.server`), then `npx @modelcontextprotocol/inspector` and point it at `http://127.0.0.1:8080/mcp` with an `Authorization: Bearer <DEVPILOT_MCP_TOKEN>` header — confirms both tools show up and are callable before wiring up a real client.
+- **Claude Code CLI** — always as ONE line (a multi-line paste that gets split loses the `--header` silently, with no error pointing at why):
   ```powershell
-  claude mcp add --transport http devpilot http://localhost:8080/mcp --header "Authorization: Bearer $env:DEVPILOT_MCP_TOKEN"
+  claude mcp add --transport http devpilot http://127.0.0.1:8080/mcp --header "Authorization: Bearer $env:DEVPILOT_MCP_TOKEN"
   ```
   registers DevPilot as an MCP server Claude Code can call in the Ask flow.
 - **Claude Desktop note**: Desktop requires **HTTPS** for remote (non-localhost) MCP servers. `http://127.0.0.1:8080` is fine while developing on the same machine; once the server moves to EC2 (Stage 2), a Desktop connection needs TLS in front of it (e.g. a reverse proxy) — Claude Code's CLI connection over plain HTTP to `127.0.0.1` is not affected by this and remains the primary dev-loop path for Stage 1.

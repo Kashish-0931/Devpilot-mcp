@@ -14,8 +14,11 @@ def create_app(token: str, store: JournalStore | None = None, port: int = 8080):
         "devpilot",
         token_verifier=StaticTokenVerifier(token),
         auth=AuthSettings(
-            issuer_url=AnyHttpUrl(f"http://localhost:{port}"),
-            resource_server_url=AnyHttpUrl(f"http://localhost:{port}/mcp"),
+            # 127.0.0.1, not localhost -- localhost can resolve to the IPv6
+            # loopback on Windows, which then fails the SDK's protected-resource
+            # metadata match against whatever host a client actually connects to.
+            issuer_url=AnyHttpUrl(f"http://127.0.0.1:{port}"),
+            resource_server_url=AnyHttpUrl(f"http://127.0.0.1:{port}/mcp"),
             required_scopes=[],
             validate_token_resource=False,
         ),
