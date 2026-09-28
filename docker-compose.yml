@@ -1,0 +1,58 @@
+services:
+  dynamodb-local:
+    image: amazon/dynamodb-local
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  bootstrap:
+    build: .
+    command: ["python", "scripts/bootstrap_local_table.py"]
+    environment:
+      AWS_ENDPOINT_URL_DYNAMODB: "http://dynamodb-local:8000"
+      AWS_ACCESS_KEY_ID: "dummy"
+      AWS_SECRET_ACCESS_KEY: "dummy"
+      AWS_DEFAULT_REGION: "ap-south-1"
+      DEVPILOT_JOURNAL_TABLE: "${DEVPILOT_JOURNAL_TABLE:-devpilot-journal}"
+    depends_on:
+      - dynamodb-local
+
+  # Sits between DevPilot and the real Docker socket, exposing only a narrow,
+  # read-only slice of the Docker API (see spec.md 7.6). DevPilot's own
+  # container never mounts the raw socket, and can stay non-root.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    environment:
+      CONTAINERS: 1
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+  devpilot:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      DEVPILOT_MCP_TOKEN: "${DEVPILOT_MCP_TOKEN}"
+      DEVPILOT_MCP_PORT: "8080"
+      DEVPILOT_JOURNAL_TABLE: "${DEVPILOT_JOURNAL_TABLE:-devpilot-journal}"
+      DEVPILOT_WATCH_CONTAINERS: "${DEVPILOT_WATCH_CONTAINERS:-demo-app}"
+      AWS_ENDPOINT_URL_DYNAMODB: "http://dynamodb-local:8000"
+      AWS_ACCESS_KEY_ID: "dummy"
+      AWS_SECRET_ACCESS_KEY: "dummy"
+      AWS_DEFAULT_REGION: "ap-south-1"
+      DOCKER_HOST: "tcp://docker-socket-proxy:2375"
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      docker-socket-proxy:
+        condition: service_started
+
+  demo-app:
+    build: ./demo-app
+    container_name: demo-app
+    environment:
+      FAILURE_MODE: "${FAILURE_MODE:-missing_env}"
+    mem_limit: 50m
+    restart: unless-stopped

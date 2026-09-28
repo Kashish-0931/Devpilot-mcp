@@ -8,6 +8,7 @@ dependencies = [
     "mcp>=2.0",
     "uvicorn",
     "python-dotenv",
+    "docker",
 ]
 
 [project.optional-dependencies]
